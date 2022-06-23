@@ -105,7 +105,6 @@ public:
      * untill all working threads have finished and closed themself.
      * @param complete_calls_ Should this action wait for all calls to end.
      * true by default.Semaphore m_
-    /**
      * @brief Return the number of working threads.
      * @return size_t Number of working threads.
      */
@@ -146,7 +145,8 @@ private:
     mutex           m_calls_lock;       // Lock for the queue's actions.
     queue<thread::id>                   // Queue of threads to remove.
                     m_to_remove;
-    mutex           m_remove_lock;      // Lock for the remove queue;
+    mutex           m_remove_lock;      // Lock for the remove queue.
+    Semaphore       m_to_remove_count;  // Number of threads to remove.
     Semaphore       m_is_empty;         // Flag when the Callable queue is empty.
     Semaphore       m_actions;          // Number of actions available.
     Semaphore       m_to_stop;          // Number of threads to stop.
@@ -156,16 +156,17 @@ private:
 /* implementation ----------------------------------------------------------- */
 
 template<class Callable>
-const size_t ThreadPool<Callable>::THREAD_MAX = thread::hardware_concurrency;
+const size_t ThreadPool<Callable>::THREAD_MAX = thread::hardware_concurrency();
 
 template<class Callable>
-ThreadPool<Callable>::ThreadPool(size_t threads_num_ = THREAD_MAX):
+ThreadPool<Callable>::ThreadPool(size_t threads_num_):
     m_status(Status::RUNNING),
     m_threads(),
     m_calls(),
     m_calls_lock(),
     m_to_remove(),
     m_remove_lock(),
+    m_to_remove_count(0),
     m_is_empty(0),
     m_actions(0),
     m_to_stop(0),
@@ -209,14 +210,17 @@ bool ThreadPool<Callable>::Continue()
     {
         case Status::RUNNING:   return true;
         case Status::FINISHED:  return false;
+        default: break;
     }
 
     // Allow all threads to run again.
     m_running_threads.post(GetSize());
+
+    return true;
 }
 
 template<class Callable>
-bool ThreadPool<Callable>::Finish(bool let_complete_ = true)
+bool ThreadPool<Callable>::Finish(bool let_complete_)
 {
     if (Status::FINISHED == m_status) return false;
 
@@ -235,7 +239,7 @@ bool ThreadPool<Callable>::Finish(bool let_complete_ = true)
 }
 
 template<class Callable>
-bool ThreadPool<Callable>::SetNumOfThreads(size_t nthread_ = THREAD_MAX)
+bool ThreadPool<Callable>::SetNumOfThreads(size_t nthread_)
 {
     if (Status::FINISHED == m_status) return false;
     if (nthread_ > THREAD_MAX) throw(length_error(
@@ -286,11 +290,44 @@ Callable ThreadPool<Callable>::Pop()
     Callable ret(move(m_calls.top()));
     m_calls.pop();
 
+    return ret;
 }                                           // Critical section end.
 
 template<class Callable>
 void ThreadPool<Callable>::ThreadLoop()
 {
+    while (1)
+    {
+        // Wait for available actions.
+        m_actions.wait();
+
+        // Handle Callable object if has access.
+        if (m_running_threads.try_wait())
+        {
+            // If a thread needs to be stopped, end loop.
+            if (m_to_stop.try_wait()) break;
+
+            // Call the first Callable object.
+            Callable call(Pop());
+            call();
+        }
+        else // If not, wait for access.
+        {
+            m_running_threads.wait();
+        }
+
+        // Free current access given by Thread Pool
+        m_running_threads.post();
+    }
+
+    // Clean up thread.
+    unique_lock<mutex> guard(m_remove_lock);    // Critical section start.
+
+    m_to_remove.push(std::this_thread::get_id());
+
+    guard.unlock();                             // Critical section end.
+
+    m_to_remove_count.post();
 
 }
 
@@ -299,8 +336,8 @@ void ThreadPool<Callable>::AddThreads(size_t nthread_)
 {
     for (size_t i = 0; i < nthread_; ++i)
     {
-        thread new_thread(ThreadLoop, this);
-        m_threads.insert(new_thread.get_id(), move(new_thread));
+        thread new_thread(&ThreadPool<Callable>::ThreadLoop, this);
+        m_threads.insert(std::pair<thread::id, thread&&>(new_thread.get_id(), move(new_thread)));
     }
 
     m_running_threads.post(nthread_);
@@ -309,7 +346,24 @@ void ThreadPool<Callable>::AddThreads(size_t nthread_)
 template<class Callable>
 void ThreadPool<Callable>::RemoveThreads(size_t nthread_)
 {
+    // Set number of threads to end.
+    m_to_stop.post(nthread_);
 
+    // Signal available stop action.
+    m_actions.post(nthread_);
+
+    for (size_t i = 0; i < nthread_; ++i)
+    {
+        m_to_remove_count.wait();
+
+        unique_lock<mutex> guard(m_remove_lock);    // Critical section start.
+
+        // Erase thread by id after it finishes.
+        m_threads.at(m_to_remove.front()).join();
+        m_threads.erase(m_to_remove.front());
+        m_to_remove.pop();
+
+    }   // Critical section end.
 }
 
 /* -------------------------------------------------------------------------- */
